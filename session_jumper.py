@@ -4,10 +4,15 @@ Session Jumper — Serialize, transfer, and resume sessions across devices.
 A "session" is a bundle of state (environment variables, working directory,
 open files, clipboard, arbitrary key-value data) that can be frozen on one
 device and thawed on another.
+
+Extended with deep execution-state serialization: freeze live Python objects,
+local variables, generator states, and class instances using dill/cloudpickle,
+then resume them on a completely different machine.
 """
 
 import gzip
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -18,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from device_discovery import Device, Transport, DiscoveryManager
 from jump_protocol import (
@@ -30,6 +35,29 @@ from jump_protocol import (
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
+
+# ── Deep Serialization Backend ───────────────────────────────────────────────
+
+def _get_serializer():
+    """Return the best available deep serializer (dill > cloudpickle > pickle)."""
+    try:
+        import dill
+        return dill
+    except ImportError:
+        pass
+    try:
+        import cloudpickle
+        return cloudpickle
+    except ImportError:
+        pass
+    import pickle
+    return pickle
+
+
+def _serializer_name() -> str:
+    """Return the name of the active serializer backend."""
+    s = _get_serializer()
+    return s.__name__
 
 
 # ── Session Model ────────────────────────────────────────────────────────────
@@ -132,6 +160,202 @@ def restore_session(session: JumpSession, restore_env: bool = False,
             dest.write_bytes(base64.b64decode(b64data))
 
     return session.metadata
+
+
+# ── Deep Execution State Serialization ────────────────────────────────────────
+
+@dataclass
+class ExecutionSnapshot:
+    """A frozen snapshot of live Python execution state.
+
+    Captures local variables, object instances, generator states, and
+    arbitrary Python objects using dill/cloudpickle for deep serialization.
+    Unlike JumpSession (which only captures env vars, cwd, and flat files),
+    this captures the *live memory* of a running program.
+    """
+    snapshot_id: str
+    source_device: str
+    timestamp: float = 0.0
+    local_vars: bytes = b""       # serialized dict of local variables
+    objects: bytes = b""          # serialized dict of named objects
+    generators: bytes = b""       # serialized generator/coroutine states
+    call_stack_info: list = field(default_factory=list)  # frame metadata (non-serializable)
+    metadata: dict = field(default_factory=dict)
+    serializer_backend: str = ""
+    checksum: str = ""
+
+    def compute_checksum(self) -> str:
+        h = hashlib.sha256()
+        h.update(self.snapshot_id.encode())
+        h.update(self.source_device.encode())
+        h.update(self.local_vars)
+        h.update(self.objects)
+        h.update(self.generators)
+        return h.hexdigest()
+
+    def validate(self) -> bool:
+        if not self.checksum:
+            return True
+        return self.checksum == self.compute_checksum()
+
+    def serialize(self) -> bytes:
+        """Serialize the snapshot to compressed bytes."""
+        serializer = _get_serializer()
+        payload = {
+            "snapshot_id": self.snapshot_id,
+            "source_device": self.source_device,
+            "timestamp": self.timestamp,
+            "local_vars": self.local_vars,
+            "objects": self.objects,
+            "generators": self.generators,
+            "call_stack_info": self.call_stack_info,
+            "metadata": self.metadata,
+            "serializer_backend": self.serializer_backend,
+            "checksum": self.checksum,
+        }
+        raw = serializer.dumps(payload)
+        return gzip.compress(raw, compresslevel=6)
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> "ExecutionSnapshot":
+        """Deserialize from compressed bytes."""
+        serializer = _get_serializer()
+        raw = gzip.decompress(data)
+        payload = serializer.loads(raw)
+        return cls(**payload)
+
+
+def freeze_execution_state(
+    snapshot_id: str,
+    source_device: str,
+    *,
+    local_vars: Optional[Dict[str, Any]] = None,
+    objects: Optional[Dict[str, Any]] = None,
+    generators: Optional[Dict[str, Any]] = None,
+    capture_caller_locals: bool = False,
+    extra_metadata: Optional[dict] = None,
+) -> ExecutionSnapshot:
+    """Freeze live Python execution state into a portable snapshot.
+
+    Args:
+        snapshot_id: Unique identifier for this snapshot.
+        source_device: Device name/ID.
+        local_vars: Dict of variable name → value to serialize.
+        objects: Dict of named objects (class instances, data structures).
+        generators: Dict of named generator/iterator objects.
+        capture_caller_locals: If True, automatically capture the caller's
+                               local variables (via frame inspection).
+        extra_metadata: Arbitrary metadata dict.
+
+    Returns:
+        ExecutionSnapshot ready for transfer via JumpSession or direct send.
+    """
+    serializer = _get_serializer()
+
+    # Auto-capture caller's locals if requested
+    if capture_caller_locals:
+        frame = inspect.currentframe()
+        if frame and frame.f_back:
+            caller_locals = {
+                k: v for k, v in frame.f_back.f_locals.items()
+                if not k.startswith("__") and _is_serializable(v, serializer)
+            }
+            if local_vars:
+                caller_locals.update(local_vars)
+            local_vars = caller_locals
+
+    # Capture call stack metadata (non-serializable frame info)
+    stack_info = []
+    for fi in inspect.stack()[1:4]:  # up to 3 frames above
+        stack_info.append({
+            "filename": fi.filename,
+            "lineno": fi.lineno,
+            "function": fi.function,
+            "code_context": (fi.code_context[0].strip()
+                             if fi.code_context else ""),
+        })
+
+    # Serialize each category
+    ser_locals = serializer.dumps(local_vars or {})
+    ser_objects = serializer.dumps(objects or {})
+    ser_generators = serializer.dumps(generators or {})
+
+    snapshot = ExecutionSnapshot(
+        snapshot_id=snapshot_id,
+        source_device=source_device,
+        timestamp=time.time(),
+        local_vars=ser_locals,
+        objects=ser_objects,
+        generators=ser_generators,
+        call_stack_info=stack_info,
+        metadata=extra_metadata or {},
+        serializer_backend=serializer.__name__,
+    )
+    snapshot.checksum = snapshot.compute_checksum()
+    return snapshot
+
+
+def thaw_execution_state(
+    snapshot: ExecutionSnapshot,
+) -> Dict[str, Any]:
+    """Restore a frozen execution snapshot, returning the thawed state.
+
+    Returns:
+        Dict with keys 'local_vars', 'objects', 'generators', each
+        containing the deserialized Python objects ready for use.
+    """
+    if not snapshot.validate():
+        raise ValueError("Snapshot checksum mismatch — data may be corrupted")
+
+    serializer = _get_serializer()
+
+    return {
+        "local_vars": serializer.loads(snapshot.local_vars) if snapshot.local_vars else {},
+        "objects": serializer.loads(snapshot.objects) if snapshot.objects else {},
+        "generators": serializer.loads(snapshot.generators) if snapshot.generators else {},
+        "call_stack_info": snapshot.call_stack_info,
+        "metadata": snapshot.metadata,
+    }
+
+
+def _is_serializable(obj: Any, serializer) -> bool:
+    """Check if an object can be serialized by the given backend."""
+    try:
+        serializer.dumps(obj)
+        return True
+    except (TypeError, AttributeError, serializer.PicklingError
+            if hasattr(serializer, "PicklingError") else TypeError):
+        return False
+
+
+def embed_snapshot_in_session(
+    session: JumpSession,
+    snapshot: ExecutionSnapshot,
+) -> JumpSession:
+    """Embed a deep ExecutionSnapshot into a JumpSession's metadata.
+
+    This allows deep state to piggyback on the existing session transfer
+    protocol without changing the wire format.
+    """
+    import base64
+    session.metadata["__deep_snapshot__"] = base64.b64encode(
+        snapshot.serialize()
+    ).decode()
+    session.metadata["__snapshot_id__"] = snapshot.snapshot_id
+    session.checksum = session.compute_checksum()
+    return session
+
+
+def extract_snapshot_from_session(
+    session: JumpSession,
+) -> Optional[ExecutionSnapshot]:
+    """Extract a deep ExecutionSnapshot from a JumpSession, if present."""
+    import base64
+    encoded = session.metadata.get("__deep_snapshot__")
+    if not encoded:
+        return None
+    raw = base64.b64decode(encoded)
+    return ExecutionSnapshot.deserialize(raw)
 
 
 # ── Jump Sender / Receiver ───────────────────────────────────────────────────

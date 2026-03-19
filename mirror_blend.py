@@ -43,6 +43,7 @@ __all__ = [
     "MirrorRegistry",
     "Blender",
     "AdaptiveWrapper",
+    "DistributedBlender",
     "MirrorError",
     "BlendError",
     "RevertError",
@@ -714,3 +715,199 @@ class AdaptiveWrapper:
     @property
     def mode(self) -> str:
         return self._adapt()
+
+
+# ─── DistributedBlender ──────────────────────────────────────────────────────
+
+class DistributedBlender:
+    """Transparent RPC offloading engine.
+
+    When local system load exceeds thresholds, intercepted function calls
+    are silently serialized, shipped to a remote node for execution, and
+    the result is returned as if computed locally.
+
+    The local application thinks it is running the function natively, but
+    the computation teleports to nodes with better hardware.
+
+    Usage:
+        registry = MirrorRegistry()
+        blender = Blender(registry)
+        dist = DistributedBlender(registry, blender)
+
+        # Register a function for potential offloading
+        dist.register(target_module, "heavy_compute", remote_executor=my_rpc_fn)
+
+        # When CPU is high, calls to target_module.heavy_compute() are
+        # transparently routed to the remote executor
+        dist.update_load(cpu_percent=95.0)
+    """
+
+    def __init__(
+        self,
+        registry: MirrorRegistry,
+        blender: Blender,
+        *,
+        cpu_threshold: float = 80.0,
+        memory_threshold: float = 85.0,
+        serializer: Optional[Any] = None,
+    ) -> None:
+        self._registry = registry
+        self._blender = blender
+        self._cpu_threshold = cpu_threshold
+        self._memory_threshold = memory_threshold
+        self._lock = threading.RLock()
+        self._slots: Dict[str, "_DistributedSlot"] = {}
+        self._metrics: Dict[str, float] = {}
+        self._offload_count: int = 0
+        self._local_count: int = 0
+
+        # Serializer for args/results (dill > cloudpickle > pickle)
+        if serializer is not None:
+            self._serializer = serializer
+        else:
+            self._serializer = self._get_serializer()
+
+    @staticmethod
+    def _get_serializer():
+        try:
+            import dill
+            return dill
+        except ImportError:
+            pass
+        try:
+            import cloudpickle
+            return cloudpickle
+        except ImportError:
+            pass
+        import pickle
+        return pickle
+
+    def register(
+        self,
+        namespace: Any,
+        name: str,
+        *,
+        remote_executor: Callable,
+        key: Optional[str] = None,
+    ) -> str:
+        """Register a function for distributed offloading.
+
+        Args:
+            namespace: Module or globals dict containing the function.
+            name: Attribute name of the function.
+            remote_executor: Callable that accepts (func_name, serialized_args)
+                             and returns serialized_result. This is the RPC
+                             transport — it handles network communication.
+            key: Optional blend key override.
+
+        Returns:
+            Registration key for later removal.
+        """
+        blend_key = key or f"distributed:{id(namespace):#x}.{name}"
+
+        ns_kind = "module" if isinstance(namespace, types.ModuleType) else "globals"
+        if ns_kind == "module":
+            original = getattr(namespace, name)
+        else:
+            original = namespace[name]
+
+        slot = _DistributedSlot(
+            name=name,
+            namespace=namespace,
+            namespace_kind=ns_kind,
+            original=original,
+            remote_executor=remote_executor,
+            blend_key=blend_key,
+        )
+
+        # Build the intercepting wrapper
+        wrapper = self._build_wrapper(slot)
+        mirror = self._registry.mirror(wrapper, name=f"{name}:distributed")
+
+        with self._lock:
+            if ns_kind == "module":
+                slot.blend_key = self._blender.blend_into_module(
+                    namespace, name, mirror, key=blend_key,
+                )
+            else:
+                slot.blend_key = self._blender.blend_into_globals(
+                    namespace, name, mirror, key=blend_key,
+                )
+            self._slots[blend_key] = slot
+
+        return blend_key
+
+    def unregister(self, key: str) -> None:
+        """Remove a distributed offloading registration."""
+        with self._lock:
+            slot = self._slots.pop(key, None)
+            if slot and slot.blend_key:
+                try:
+                    self._blender.revert(slot.blend_key)
+                except BlendError:
+                    pass
+
+    def update_load(self, **metrics: float) -> None:
+        """Update system load metrics (cpu_percent, memory_percent, etc.)."""
+        with self._lock:
+            self._metrics.update(metrics)
+
+    @property
+    def should_offload(self) -> bool:
+        """Whether current load exceeds thresholds for offloading."""
+        cpu = self._metrics.get("cpu_percent", 0.0)
+        mem = self._metrics.get("memory_percent", 0.0)
+        return cpu > self._cpu_threshold or mem > self._memory_threshold
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "offload_count": self._offload_count,
+            "local_count": self._local_count,
+            "should_offload": self.should_offload,
+            "metrics": dict(self._metrics),
+            "registered": len(self._slots),
+        }
+
+    def _build_wrapper(self, slot: "_DistributedSlot") -> Callable:
+        """Build the transparent wrapper that decides local vs remote."""
+        dist_blender = self  # capture reference
+
+        @functools.wraps(slot.original)
+        def distributed_wrapper(*args: Any, **kwargs: Any) -> Any:
+            if dist_blender.should_offload:
+                try:
+                    return dist_blender._execute_remote(
+                        slot, args, kwargs,
+                    )
+                except Exception:
+                    # Fallback to local on remote failure
+                    pass
+            dist_blender._local_count += 1
+            return slot.original(*args, **kwargs)
+
+        return distributed_wrapper
+
+    def _execute_remote(
+        self,
+        slot: "_DistributedSlot",
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        """Serialize args, send to remote, deserialize result."""
+        serialized_args = self._serializer.dumps({"args": args, "kwargs": kwargs})
+        serialized_result = slot.remote_executor(slot.name, serialized_args)
+        result = self._serializer.loads(serialized_result)
+        self._offload_count += 1
+        return result
+
+
+@dataclass(slots=True)
+class _DistributedSlot:
+    """Tracks one distributed-offload registration."""
+    name: str
+    namespace: Any
+    namespace_kind: str  # "module" | "globals"
+    original: Callable
+    remote_executor: Callable
+    blend_key: str
