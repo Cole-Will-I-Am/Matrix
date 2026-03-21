@@ -145,4 +145,4 @@ python -m unittest discover -s tests -v
 
 ## License
 
-MIT
+All rights reserved.
