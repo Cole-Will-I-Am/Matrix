@@ -345,7 +345,7 @@ class TaskRelay:
         # RBAC check
         if self._rbac is not None:
             try:
-                from rbac import Permission
+                from matrix.rbac import Permission
                 # Relay messages carry source identity; check RELAY permission
                 # Use source_id as a proxy for auth (in practice, the node
                 # that forwarded this would have been authenticated at the
@@ -417,7 +417,7 @@ class TaskRelay:
 
     def _forward_to_hop(self, route: RelayEntry, message: RelayMessage) -> None:
         """Send a relay message to the next hop."""
-        from jump_protocol import (
+        from matrix.jump_protocol import (
             MsgType, client_handshake, DirectTCPBackend,
         )
         import socket
@@ -473,7 +473,7 @@ class TaskRelay:
 
     def broadcast_routes(self) -> int:
         """Send our relay table to all connected peers. Returns peers contacted."""
-        from jump_protocol import MsgType, client_handshake, DirectTCPBackend
+        from matrix.jump_protocol import MsgType, client_handshake, DirectTCPBackend
         import socket
 
         entries = self._table.to_entries()

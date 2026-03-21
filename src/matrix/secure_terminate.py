@@ -268,7 +268,7 @@ class SecureTerminator:
                              "RBAC configured but no auth token provided")
                 raise TerminationError("auth token required when RBAC is configured")
             try:
-                from rbac import Permission
+                from matrix.rbac import Permission
                 self._rbac.require_permission(
                     auth_token, Permission.TERMINATE,
                     target_node_id=command.target_node_id,
@@ -339,7 +339,7 @@ class SecureTerminator:
 
     def _cascade(self, command: TerminationCommand) -> None:
         """Propagate termination to connected peers (best-effort)."""
-        from jump_protocol import MsgType
+        from matrix.jump_protocol import MsgType
         cascade_cmd = TerminationCommand(
             command_id=str(uuid.uuid4()),
             issuer_id=command.issuer_id,
@@ -362,7 +362,7 @@ class SecureTerminator:
         propagated = 0
         for peer in peers:
             try:
-                from jump_protocol import client_handshake, DirectTCPBackend
+                from matrix.jump_protocol import client_handshake, DirectTCPBackend
                 import socket
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5.0)

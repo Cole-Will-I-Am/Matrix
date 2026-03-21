@@ -3,10 +3,11 @@
 Jump CLI — Command-line interface for cross-device jumping.
 
 Usage:
-    python jump_cli.py listen [--port PORT] [--token TOKEN]
-    python jump_cli.py discover [--timeout SECONDS]
-    python jump_cli.py jump <target> [--files FILE ...] [--token TOKEN]
-    python jump_cli.py send-file <target> <filepath> [--token TOKEN]
+    matrix listen [--port PORT] [--token TOKEN]
+    matrix discover [--timeout SECONDS]
+    matrix jump <target> [--files FILE ...] [--token TOKEN]
+    matrix multiply --targets <target...> [--strategy STRATEGY]
+    matrix status | rain | config
 """
 
 import argparse
@@ -26,19 +27,46 @@ from matrix.session_jumper import (
 logger = logging.getLogger(__name__)
 
 
+def _maybe_restore_files(session: JumpSession, mode: str) -> None:
+    """Restore received files according to policy: ask, always, or never."""
+    if not session.files:
+        return
+    if mode == "never":
+        logger.info("  File restore policy is 'never'; skipping received files.")
+        return
+    if mode == "always":
+        restore_session(session, restore_files=True)
+        logger.info("  Files restored.")
+        return
+
+    # mode == "ask"
+    if not sys.stdin.isatty():
+        logger.warning("  Non-interactive stdin; skipping file restore prompt.")
+        return
+    try:
+        restore = input("  Restore files to current directory? [y/N] ").strip().lower()
+    except (EOFError, OSError):
+        logger.warning("  Unable to read restore prompt input; skipping file restore.")
+        return
+    if restore == "y":
+        restore_session(session, restore_files=True)
+        logger.info("  Files restored.")
+
+
 def cmd_listen(args):
     """Start a jump listener, waiting for incoming sessions."""
+    restore_mode = args.restore_files
+
     def on_session(session: JumpSession):
-        logger.info(f"\n[RECEIVED] Session '{session.session_id}' from {session.source_device}")
-        logger.info(f"  Timestamp: {time.ctime(session.timestamp)}")
-        logger.info(f"  Source CWD: {session.cwd}")
-        logger.info(f"  Files: {len(session.files)}")
-        logger.info(f"  Metadata: {json.dumps(session.metadata, indent=2)}")
-        if session.files:
-            restore = input("  Restore files to current directory? [y/N] ").strip().lower()
-            if restore == "y":
-                restore_session(session, restore_files=True)
-                logger.info("  Files restored.")
+        try:
+            logger.info(f"\n[RECEIVED] Session '{session.session_id}' from {session.source_device}")
+            logger.info(f"  Timestamp: {time.ctime(session.timestamp)}")
+            logger.info(f"  Source CWD: {session.cwd}")
+            logger.info(f"  Files: {len(session.files)}")
+            logger.info(f"  Metadata: {json.dumps(session.metadata, indent=2)}")
+            _maybe_restore_files(session, restore_mode)
+        except Exception:
+            logger.exception("Failed to process received session '%s'", session.session_id)
 
     node = JumpNode(
         node_name=args.name or socket.gethostname(),
@@ -103,7 +131,7 @@ def cmd_jump(args):
     target = _resolve_target(args.target, node, timeout=5)
     if not target:
         logger.error(f"Error: Could not find device '{args.target}'")
-        logger.info("Tip: Use 'jump_cli.py discover' to find nearby devices,")
+        logger.info("Tip: Use 'matrix discover' to find nearby devices,")
         logger.info("     or specify an IP:PORT directly (e.g. 192.168.1.50:47701)")
         node.stop()
         sys.exit(1)
@@ -279,6 +307,12 @@ def main():
 
     # listen
     p_listen = sub.add_parser("listen", help="Listen for incoming jumps")
+    p_listen.add_argument(
+        "--restore-files",
+        choices=["ask", "always", "never"],
+        default="ask",
+        help="Restore received files policy (default: ask)",
+    )
 
     # discover
     p_discover = sub.add_parser("discover", help="Discover nearby devices")

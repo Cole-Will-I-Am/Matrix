@@ -716,7 +716,7 @@ class JumpNode:
         # Determine auth validator
         auth_validator = None
         if rbac_manager is not None:
-            from rbac import Permission
+            from matrix.rbac import Permission
             auth_validator = rbac_manager.make_auth_validator(Permission.JUMP)
         elif auth_token:
             auth_validator = self._validate_auth
@@ -740,7 +740,7 @@ class JumpNode:
             msg_type, payload = conn.recv()
             if msg_type == MsgType.RELAY and self._task_relay is not None:
                 import json as _json
-                from task_relay import RelayMessage
+                from matrix.task_relay import RelayMessage
                 msg = RelayMessage.from_dict(_json.loads(payload.decode()))
                 self._task_relay.handle_incoming(msg)
             elif msg_type == MsgType.ROUTE_UPDATE and self._task_relay is not None:
@@ -759,6 +759,8 @@ class JumpNode:
                     self.on_session_received(session)
         except (ProtocolError, ValueError, ConnectionError):
             pass
+        except Exception:
+            logger.exception("unexpected error while handling inbound connection")
         finally:
             conn.close()
 

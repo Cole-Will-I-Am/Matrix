@@ -71,7 +71,7 @@ def _probe_websocket(url: str, timeout: float) -> ProbeResult:
     """Probe via WebSocket connection."""
     t0 = time.monotonic()
     try:
-        from transport_ws import WebSocketBackend
+        from matrix.transport_ws import WebSocketBackend
         backend = WebSocketBackend.connect(url, timeout=timeout)
         rtt = (time.monotonic() - t0) * 1000
         return ProbeResult("websocket", True, rtt, backend)
@@ -262,7 +262,7 @@ class TransportNegotiator:
         """
         t0 = time.monotonic()
         try:
-            from dead_drop import DeadDropBackend, CloudProvider, FileSystemDeadDrop
+            from matrix.dead_drop import DeadDropBackend, CloudProvider, FileSystemDeadDrop
             # For filesystem provider, verify the path exists
             if config.provider == CloudProvider.FILESYSTEM:
                 import os

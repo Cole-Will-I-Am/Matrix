@@ -309,17 +309,24 @@ class WebSocketBackend:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
 
-        if use_ssl:
-            ctx = ssl.create_default_context()
-            if not verify_ssl:
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            sock = ctx.wrap_socket(sock, server_hostname=host)
+        try:
+            if use_ssl:
+                ctx = ssl.create_default_context()
+                if not verify_ssl:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=host)
 
-        sock.connect((host, port))
+            sock.connect((host, port))
 
-        # WebSocket upgrade — capture any excess bytes
-        excess = _ws_client_handshake(sock, host_port, path)
+            # WebSocket upgrade — capture any excess bytes
+            excess = _ws_client_handshake(sock, host_port, path)
+        except Exception:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
 
         backend = cls(sock, is_client=True, initial_buf=excess)
         backend._peer_addr = f"{'wss' if use_ssl else 'ws'}://{host}:{port}{path}"

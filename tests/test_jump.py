@@ -949,7 +949,8 @@ class TestSecurityHardening(unittest.TestCase):
             restore_session(session, restore_files=True, target_dir=td)
             written = os.path.join(td, "subdir", "hello.txt")
             self.assertTrue(os.path.exists(written))
-            self.assertEqual(open(written, "rb").read(), b"hello")
+            with open(written, "rb") as f:
+                self.assertEqual(f.read(), b"hello")
 
     def test_env_injection_blocked(self):
         """restore_session must not set dangerous env vars like LD_PRELOAD."""

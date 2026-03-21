@@ -5,10 +5,24 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/root/Matrix
-ExecStart=/usr/local/bin/matrix listen
+ExecStart=/usr/bin/env matrix listen --restore-files never
 EnvironmentFile=-/root/Matrix/.env
 Restart=always
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+UMask=0077
 StandardOutput=journal
 StandardError=journal
 

@@ -286,7 +286,7 @@ class NodeManager:
         if target is None:
             raise ManagerError(f"unknown target node: {task.target_node_id}")
 
-        from device_discovery import Device, Transport
+        from matrix.device_discovery import Device, Transport
         device = Device(
             device_id=target.node_id,
             name=target.node_name,
@@ -427,11 +427,11 @@ class NodeManager:
         # RBAC check — mandatory when RBAC is configured
         if self._rbac is not None:
             if auth_token is None:
-                from rbac import AuthorizationError
+                from matrix.rbac import AuthorizationError
                 raise AuthorizationError(
                     "auth token required when RBAC is configured"
                 )
-            from rbac import Permission
+            from matrix.rbac import Permission
             perm_map = {
                 TaskType.JUMP: Permission.JUMP,
                 TaskType.DISCOVER: Permission.DISCOVER,

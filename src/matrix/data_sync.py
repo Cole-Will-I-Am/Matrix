@@ -405,7 +405,7 @@ class SyncManager:
             peer_manifest_data: Pre-exchanged manifest bytes (skip exchange step).
             on_progress: Callback(key, bytes_sent, total_bytes).
         """
-        from jump_protocol import MsgType
+        from matrix.jump_protocol import MsgType
         start = time.time()
         result = SyncResult()
 
@@ -463,7 +463,7 @@ class SyncManager:
         on_progress: Optional[Callable] = None,
     ) -> int:
         """Send data in rate-limited chunks with delivery tracking."""
-        from jump_protocol import MsgType
+        from matrix.jump_protocol import MsgType
 
         total = len(data)
         offset = 0
@@ -533,7 +533,7 @@ class SyncManager:
         key: str,
     ) -> Tuple[Optional[bytes], int]:
         """Receive chunked data for a key."""
-        from jump_protocol import MsgType
+        from matrix.jump_protocol import MsgType
 
         total_received = 0
 
@@ -624,7 +624,7 @@ class SyncManager:
                 continue
 
             try:
-                from jump_protocol import MsgType
+                from matrix.jump_protocol import MsgType
                 chunk_hash = hashlib.sha256(chunk).hexdigest()
                 header = json.dumps({
                     "key": key,

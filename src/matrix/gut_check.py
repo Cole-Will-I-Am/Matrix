@@ -348,7 +348,7 @@ class InstrumentedRain:
     """Wraps MatrixRain with live call-counting and timing stats via mirror_blend."""
 
     def __init__(self):
-        from mirror_blend import MirrorRegistry, Blender, AdaptiveWrapper
+        from matrix.mirror_blend import MirrorRegistry, Blender, AdaptiveWrapper
 
         self.registry = MirrorRegistry()
         self.blender = Blender(self.registry)

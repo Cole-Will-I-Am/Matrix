@@ -41,7 +41,7 @@ Transfer your working session (environment, files, clipboard) between machines o
 
 | Module | Purpose |
 |---|---|
-| `cli.py` | CLI entry point — listen, discover, jump, multiply, status, rain |
+| `cli.py` | CLI entry point — listen, discover, jump, multiply, status, rain, config |
 | `jump_protocol.py` | Binary framing + X25519 key exchange + ratcheted AES-256-GCM |
 | `symmetric_ratchet.py` | Signal-spec KDF_CK chain ratchet for per-message forward secrecy |
 | `session_jumper.py` | Serialize, transfer, and resume sessions across devices |
@@ -72,8 +72,8 @@ matrix status
 # Discover nearby devices
 matrix discover --timeout 10
 
-# Listen for incoming jumps
-matrix listen --port 47701
+# Listen for incoming jumps (interactive restore prompts)
+matrix listen --port 47701 --restore-files ask
 
 # Jump to a target
 matrix jump 192.168.1.50:47701
@@ -120,6 +120,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now matrix
 sudo journalctl -u matrix -f
 ```
+
+The bundled unit runs with additional `systemd` hardening (`NoNewPrivileges`, `ProtectSystem`, capability drop, syscall/address-family restrictions) and starts listener mode with `--restore-files never` for non-interactive safety.
 
 ## Development
 
