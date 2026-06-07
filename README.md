@@ -33,7 +33,7 @@ Transfer your working session (environment, files, clipboard) between machines o
          └──────────────┘└─────────┘
 
       ── Layer 0 (no internal deps) ─────────────────────────
-      rbac, dead_drop, secure_terminate, task_relay,
+      rbac, dead_drop, secure_terminate, task_relay, identity,
       node_manager, transport_ws, data_sync, config
 ```
 
@@ -42,8 +42,9 @@ Transfer your working session (environment, files, clipboard) between machines o
 | Module | Purpose |
 |---|---|
 | `cli.py` | CLI entry point — listen, discover, jump, multiply, status, rain, config, director |
-| `jump_protocol.py` | Binary framing + X25519 key exchange + ratcheted AES-256-GCM |
+| `jump_protocol.py` | Binary framing + X25519 key exchange + ratcheted AES-256-GCM + mutual identity auth |
 | `symmetric_ratchet.py` | Signal-spec KDF_CK chain ratchet for per-message forward secrecy |
+| `identity.py` | Ed25519 node identities + SSH-style peer trust store (pinning) |
 | `session_jumper.py` | Serialize, transfer, and resume sessions across devices |
 | `device_discovery.py` | WiFi multicast + Bluetooth device scanning |
 | `transport_ws.py` | WebSocket transport (tunnels through firewalls on 80/443) |
@@ -74,14 +75,19 @@ matrix status
 # Discover nearby devices
 matrix discover --timeout 10
 
-# Listen for incoming jumps (interactive restore prompts)
-matrix listen --port 47701 --restore-files ask
+# Listen for incoming jumps. The listener binds all interfaces, so an auth
+# token is required (an unauthenticated public bind is refused):
+matrix --token "$MATRIX_AUTH_TOKEN" listen --restore-files ask
 
-# Jump to a target
-matrix jump 192.168.1.50:47701
+# Jump to a target (outbound; its local listener binds loopback only)
+matrix --token "$MATRIX_AUTH_TOKEN" jump 192.168.1.50:47701
 
 # Duplicate session to all discovered devices
-matrix multiply --all --strategy broadcast
+matrix --token "$MATRIX_AUTH_TOKEN" multiply --all --strategy broadcast
+
+# Mutual identity authentication (defeats MITM): create/pin Ed25519 identities
+matrix --identity ~/.matrix/id.ed25519 --known-peers ~/.matrix/known_peers \
+       --require-identity --token "$MATRIX_AUTH_TOKEN" listen
 
 # Matrix rain
 matrix rain

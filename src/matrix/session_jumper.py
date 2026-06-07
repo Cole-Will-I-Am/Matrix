@@ -733,9 +733,11 @@ class JumpNode:
                  task_relay=None,
                  identity=None,
                  trust_store=None,
-                 require_peer_identity: bool = False):
+                 require_peer_identity: bool = False,
+                 listen_host: str = "0.0.0.0"):
         self.node_name = node_name or socket.gethostname()
         self.listen_port = listen_port
+        self.listen_host = listen_host
         self.auth_token = auth_token
         self.on_session_received = on_session_received
         self._rbac_manager = rbac_manager
@@ -757,6 +759,7 @@ class JumpNode:
             auth_validator = self._validate_auth
 
         self.listener = JumpListener(
+            host=listen_host,
             port=listen_port,
             auth_validator=auth_validator,
             on_connection=self._handle_connection,

@@ -884,6 +884,24 @@ class TestMultiJumpNodeIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestJumpNodeBindHost(unittest.TestCase):
+    """Outbound commands must bind loopback so they don't need an auth token."""
+
+    def test_default_host_is_public(self):
+        node = JumpNode(listen_port=0)
+        self.assertEqual(node.listener.host, "0.0.0.0")
+
+    def test_listen_host_wired_to_listener(self):
+        node = JumpNode(listen_port=0, listen_host="127.0.0.1")
+        self.assertEqual(node.listener.host, "127.0.0.1")
+        # Loopback bind is permitted without an auth token (no public exposure).
+        try:
+            node.listener.start()
+        finally:
+            node.listener.stop()
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
 class TestJumpSingleRetry(unittest.TestCase):
     def test_retry_on_failure(self):
         bad_target = Device("bad", "Unreachable", "127.0.0.1", Transport.WIFI,

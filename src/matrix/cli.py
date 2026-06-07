@@ -160,6 +160,8 @@ def cmd_jump(args):
         identity=identity,
         trust_store=trust_store,
         require_peer_identity=require_identity,
+        # Outbound command: no need for a public inbound listener.
+        listen_host="127.0.0.1",
     )
     node.start()
     logger.info(f"Resolving target '{args.target}'...")
@@ -205,6 +207,8 @@ def cmd_multiply(args):
         identity=identity,
         trust_store=trust_store,
         require_peer_identity=require_identity,
+        # Outbound command: no need for a public inbound listener.
+        listen_host="127.0.0.1",
     )
     node.start()
 
