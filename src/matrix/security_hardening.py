@@ -7,4 +7,4 @@ wire framing primitives. It addresses two high-risk defaults:
 * TCP listeners no longer bind publicly without authentication.
 
 The hardened handshake authenticates after X25519 key agreement by sending the
-bearer token inside the newly encrypted
+bearer token inside the newly encrypted channel. Auth
