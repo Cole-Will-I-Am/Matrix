@@ -560,6 +560,33 @@ class TestWebSocketBackend(unittest.TestCase):
         client.close()
         server.close()
 
+    def test_initial_buf_seeds_only_ws_parser(self):
+        """Coalesced upgrade+frame: excess must be WS-decoded, not returned raw.
+
+        Regression for a bug where ``initial_buf`` (raw WS framing left over
+        from the HTTP upgrade read) was also seeded into the decoded-payload
+        buffer, so recv_bytes() returned WS header/mask bytes to the caller.
+        """
+        # Build a complete, unmasked binary frame for a known payload.
+        captured = bytearray()
+
+        class _Capture:
+            def sendall(self, data):
+                captured.extend(data)
+
+        payload = b"JUMP-PAYLOAD-123"
+        _ws_write_frame(_Capture(), WS_BINARY, payload, mask=False)
+
+        s1, s2 = socket.socketpair()
+        try:
+            backend = WebSocketBackend(s1, is_client=True,
+                                       initial_buf=bytearray(captured))
+            # Must decode the framed payload, not hand back raw framing bytes.
+            self.assertEqual(backend.recv_bytes(len(payload)), payload)
+        finally:
+            s1.close()
+            s2.close()
+
     def test_jump_handshake_over_websocket(self):
         """Full Jump protocol handshake over WebSocket transport."""
         client_ws, server_ws = self._make_ws_pair()

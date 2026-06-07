@@ -252,7 +252,12 @@ class WebSocketBackend:
         self._sock = sock
         self._is_client = is_client  # clients must mask frames per RFC 6455
         self._connected = True
-        self._recv_buf = bytearray(initial_buf) if initial_buf else bytearray()
+        # `initial_buf` is leftover bytes read past the HTTP upgrade — i.e. the
+        # start of the first WebSocket frame(s). Those are raw WS framing bytes,
+        # so they seed ONLY the WS parser buffer. The decoded-payload buffer
+        # (_recv_buf, what recv_bytes returns) must start empty; otherwise a
+        # coalesced upgrade+frame read leaks WS header/mask bytes to the caller.
+        self._recv_buf = bytearray()
         self._ws_buf = bytearray(initial_buf) if initial_buf else bytearray()
         self._lock = threading.Lock()
         self._recv_lock = threading.Lock()
