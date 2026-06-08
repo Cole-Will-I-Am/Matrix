@@ -273,6 +273,21 @@ class TestEscalationDetector(unittest.TestCase):
         det.notify_transport_failure()
         self.assertEqual(len(fired), 1)  # Suppressed by cooldown
 
+    def test_first_escalation_fires_on_low_uptime(self):
+        # Regression: cooldown is measured against time.monotonic() (uptime).
+        # With a 0.0 baseline, the first escalation was wrongly suppressed
+        # whenever uptime < cooldown_s. Simulate low uptime (10s) + long
+        # cooldown and confirm the first escalation still fires.
+        fired = []
+        with patch("matrix.director.time.monotonic", return_value=10.0):
+            det = EscalationDetector(cooldown_s=999, task_failure_threshold=1)
+            det.attach(on_escalation=lambda e: fired.append(e))
+            det.record_task_failure("t1", "err")
+            det.check()
+            self.assertEqual(len(fired), 1)
+            det.notify_transport_failure()
+            self.assertEqual(len(fired), 1)  # now within cooldown -> suppressed
+
 
 # ── ToolExecutor ─────────────────────────────────────────────────────────────
 

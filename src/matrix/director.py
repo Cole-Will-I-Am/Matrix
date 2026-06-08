@@ -210,7 +210,11 @@ class EscalationDetector:
         self._task_failure_threshold = task_failure_threshold
 
         self._lock = threading.Lock()
-        self._last_escalation: float = 0.0
+        # Sentinel "never escalated". Must NOT be 0.0: cooldown is measured
+        # against time.monotonic() (uptime), so a 0.0 baseline would suppress
+        # the very first escalation whenever uptime < cooldown_s (e.g. the
+        # entire first minute after boot with the default 60s cooldown).
+        self._last_escalation: float = float("-inf")
         self._degraded_since: Optional[float] = None
         self._task_failures: List[float] = []
         self._on_escalation: Optional[Callable[[EscalationEvent], None]] = None

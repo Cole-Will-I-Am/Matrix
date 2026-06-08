@@ -12,11 +12,26 @@ from unittest.mock import MagicMock, patch
 
 from matrix.session_jumper import (
     JumpSession, capture_session, restore_session,
-    TransferState, TransferStateStore,
+    receive_session, TransferState, TransferStateStore, TransferStateStore as _TSS,
     MultiJumpStrategy, MultiJumpResult, TargetResult,
-    JumpError,
+    JumpError, MAX_SESSION_SIZE,
 )
+from matrix.jump_protocol import MsgType, ProtocolError
 from matrix.device_discovery import Device, Transport
+
+
+class _FakeConn:
+    """Minimal JumpConnection stand-in for exercising receive_session."""
+
+    def __init__(self, incoming):
+        self._incoming = list(incoming)
+        self.sent = []
+
+    def recv_json(self):
+        return self._incoming.pop(0)
+
+    def send_json(self, msg_type, obj):
+        self.sent.append((msg_type, obj))
 
 
 class TestJumpSession(unittest.TestCase):
@@ -90,6 +105,43 @@ class TestJumpSession(unittest.TestCase):
         restored = JumpSession.deserialize(data)
         self.assertIn("test.txt", restored.files)
         self.assertEqual(base64.b64decode(restored.files["test.txt"]), content)
+
+    def test_deserialize_rejects_decompression_bomb(self):
+        # ~50 MiB of zeros compresses to a few KiB; deserializing with a small
+        # cap must refuse to inflate it rather than exhausting memory.
+        bomb = gzip.compress(b"\x00" * (50 * 1024 * 1024))
+        self.assertLess(len(bomb), 1024 * 1024)  # tiny on the wire
+        with self.assertRaises(ValueError):
+            JumpSession.deserialize(bomb, max_size=1024 * 1024)
+
+    def test_deserialize_allows_session_within_cap(self):
+        session = self._make_session()
+        data = session.serialize()
+        restored = JumpSession.deserialize(data, max_size=10 * 1024 * 1024)
+        self.assertEqual(restored.session_id, session.session_id)
+
+
+class TestReceiveSessionLimits(unittest.TestCase):
+    """receive_session must reject hostile declared sizes before buffering."""
+
+    def _meta_frame(self, size):
+        return (MsgType.SESSION_DATA, {"meta": {
+            "session_id": "s1", "size": size, "checksum": "", "resumable": False,
+        }})
+
+    def test_rejects_oversized_declared_size(self):
+        conn = _FakeConn([self._meta_frame(MAX_SESSION_SIZE + 1)])
+        with self.assertRaises(ProtocolError):
+            receive_session(conn, transfer_store=_TSS())
+        # Sender is told why, and no buffering happened.
+        self.assertEqual(conn.sent[0][0], MsgType.ERROR)
+        self.assertEqual(conn.sent[0][1]["error"], "session_too_large")
+
+    def test_rejects_non_integer_size(self):
+        conn = _FakeConn([self._meta_frame("not-a-number")])
+        with self.assertRaises(ProtocolError):
+            receive_session(conn, transfer_store=_TSS())
+        self.assertEqual(conn.sent[0][1]["error"], "invalid_size")
 
 
 class TestCaptureSession(unittest.TestCase):

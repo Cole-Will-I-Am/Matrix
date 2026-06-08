@@ -125,6 +125,7 @@ cp .env.example .env
 | `MATRIX_CHUNK_SIZE` | `65536` | Transfer chunk size (bytes) |
 | `MATRIX_MAX_PAYLOAD` | `16777216` | Max frame payload (bytes) |
 | `MATRIX_MAX_FILE_SIZE` | `10485760` | Max file size for session capture (bytes) |
+| `MATRIX_MAX_SESSION_SIZE` | `67108864` | Max received session size — caps both buffered transfer and decompressed result (bytes) |
 | `MATRIX_AUTH_TOKEN` | | Authentication token for secure jumps |
 | `MATRIX_NODE_NAME` | | Custom node name (default: hostname) |
 | `MATRIX_LLM_BACKEND` | `ollama` | LLM provider: `ollama` or `anthropic` |
@@ -185,6 +186,7 @@ Safety constraints: action budget (default 5), dead-man's switch timeout, AST qu
 - **Authentication**: encrypted post-handshake `AUTH`/`AUTH_OK` exchange — the token is never sent in cleartext (including on 0-RTT resume); RBAC with constant-time token comparison
 - **Safe binding**: an unauthenticated listener refuses to bind a public interface; set an auth token to listen beyond `127.0.0.1`
 - **Replay protection**: Nonce tracking with TTL expiry
+- **Resource limits**: Received sessions are bounded (`MATRIX_MAX_SESSION_SIZE`) on both the buffered transfer and the decompressed result, resisting buffer-exhaustion and gzip-bomb DoS
 - **Traffic analysis resistance**: Frame padding, timing jitter, cover traffic, protocol mimicry
 - **Secure cleanup**: Chain key zeroization, state wiping on termination
 

@@ -64,6 +64,12 @@ class MatrixConfig:
     chunk_size: int = _env("MATRIX_CHUNK_SIZE", 65536, int)
     max_payload: int = _env("MATRIX_MAX_PAYLOAD", 16777216, int)
     max_file_size: int = _env("MATRIX_MAX_FILE_SIZE", 10485760, int)
+    # Upper bound on a single received session, applied to BOTH the buffered
+    # (compressed) transfer and the decompressed result. Since gzip output is
+    # never meaningfully larger than its input, one bound caps both the
+    # buffer-exhaustion vector (huge declared size) and the decompression-bomb
+    # vector (small payload, huge inflation). 64 MiB by default.
+    max_session_size: int = _env("MATRIX_MAX_SESSION_SIZE", 67108864, int)
 
     # Auth (optional)
     auth_token: str | None = _env("MATRIX_AUTH_TOKEN", None)

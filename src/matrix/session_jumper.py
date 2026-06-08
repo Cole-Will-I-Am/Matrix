@@ -18,6 +18,7 @@ import os
 import socket
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -37,6 +38,32 @@ from matrix.config import config as _config
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = _config.max_file_size
+MAX_SESSION_SIZE = _config.max_session_size
+
+# gzip-format window bits for zlib's streaming decompressor.
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+
+
+def _bounded_gunzip(data: bytes, max_output: int) -> bytes:
+    """Decompress gzip *data*, refusing to emit more than *max_output* bytes.
+
+    Guards against decompression bombs: a small ciphertext that inflates to
+    gigabytes. Uses zlib's incremental decompressor with a hard output cap
+    rather than gzip.decompress, which buffers the entire result unbounded.
+    """
+    decompressor = zlib.decompressobj(_GZIP_WBITS)
+    # Ask for one byte beyond the cap so any overflow is observable.
+    out = decompressor.decompress(data, max_output + 1)
+    if len(out) > max_output or decompressor.unconsumed_tail:
+        raise ValueError(
+            f"Decompressed session exceeds limit ({max_output} bytes)"
+        )
+    out += decompressor.flush()
+    if len(out) > max_output:
+        raise ValueError(
+            f"Decompressed session exceeds limit ({max_output} bytes)"
+        )
+    return out
 
 
 # == Session Model =============================================================
@@ -63,9 +90,13 @@ class JumpSession:
         return compressed
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "JumpSession":
-        """Deserialize from compressed JSON bytes."""
-        raw = gzip.decompress(data)
+    def deserialize(cls, data: bytes,
+                    max_size: int = MAX_SESSION_SIZE) -> "JumpSession":
+        """Deserialize from compressed JSON bytes.
+
+        Decompression is bounded by *max_size* to resist gzip bombs.
+        """
+        raw = _bounded_gunzip(data, max_size)
         d = json.loads(raw.decode())
         return cls(**d)
 
@@ -355,7 +386,21 @@ def receive_session(conn: JumpConnection,
         raise ProtocolError(f"Expected SESSION_DATA, got {msg_type}")
 
     meta = info["meta"]
-    expected_size = meta["size"]
+    expected_size = meta.get("size")
+    # Reject a bogus or oversized declared size before buffering anything: the
+    # receiver would otherwise accumulate `expected_size` attacker-controlled
+    # bytes in memory (buffer-exhaustion DoS).
+    if not isinstance(expected_size, int) or expected_size < 0:
+        conn.send_json(MsgType.ERROR, {"error": "invalid_size"})
+        raise ProtocolError(f"Invalid declared session size: {expected_size!r}")
+    if expected_size > MAX_SESSION_SIZE:
+        conn.send_json(MsgType.ERROR, {
+            "error": "session_too_large",
+            "max": MAX_SESSION_SIZE,
+        })
+        raise ProtocolError(
+            f"Declared session size {expected_size} exceeds limit {MAX_SESSION_SIZE}"
+        )
     session_id = meta.get("session_id", "")
     checksum = meta.get("checksum", "")
     resumable = meta.get("resumable", False)
