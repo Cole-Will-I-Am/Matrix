@@ -30,6 +30,14 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+from matrix.config import config as _config
+
+# Hard cap on a single inbound WebSocket frame. A frame carries exactly one
+# JMP frame (≤ max_payload, enforced by the jump layer) plus its 14-byte
+# header, so anything beyond this is hostile. Enforced *before* buffering the
+# payload so a malicious 64-bit length field cannot exhaust memory.
+MAX_WS_FRAME = _config.max_payload + 1024
+
 
 # == WebSocket frame helpers (RFC 6455, minimal implementation) =================
 
@@ -62,10 +70,13 @@ def _ws_recv_exact(sock, n: int, buf: bytearray = None) -> bytes:
     return bytes(result)
 
 
-def _ws_read_frame(sock, buf: bytearray = None) -> tuple[int, bytes]:
+def _ws_read_frame(sock, buf: bytearray = None,
+                   max_frame: int = MAX_WS_FRAME) -> tuple[int, bytes]:
     """Read a single WebSocket frame, return (opcode, payload).
 
     If buf is provided, consumes buffered data before reading from socket.
+    Frames declaring a payload larger than *max_frame* are rejected before
+    the payload is read, bounding peak memory against a hostile length field.
     """
     header = _ws_recv_exact(sock, 2, buf)
     opcode = header[0] & 0x0F
@@ -76,6 +87,11 @@ def _ws_read_frame(sock, buf: bytearray = None) -> tuple[int, bytes]:
         length = struct.unpack("!H", _ws_recv_exact(sock, 2, buf))[0]
     elif length == 127:
         length = struct.unpack("!Q", _ws_recv_exact(sock, 8, buf))[0]
+
+    if length > max_frame:
+        raise ConnectionError(
+            f"WebSocket frame too large: {length} > {max_frame}"
+        )
 
     mask_key = _ws_recv_exact(sock, 4, buf) if masked else None
 
@@ -252,7 +268,12 @@ class WebSocketBackend:
         self._sock = sock
         self._is_client = is_client  # clients must mask frames per RFC 6455
         self._connected = True
-        self._recv_buf = bytearray(initial_buf) if initial_buf else bytearray()
+        # _recv_buf holds DECODED application bytes; _ws_buf holds RAW,
+        # still-framed bytes consumed by _ws_read_frame. The post-handshake
+        # excess is raw frame data, so it belongs only in _ws_buf — seeding
+        # _recv_buf with it would feed undecoded (possibly masked) frame bytes
+        # straight to the caller and then decode the same bytes again.
+        self._recv_buf = bytearray()
         self._ws_buf = bytearray(initial_buf) if initial_buf else bytearray()
         self._lock = threading.Lock()
         self._recv_lock = threading.Lock()
@@ -353,7 +374,11 @@ class WebSocketBackend:
                     self._connected = False
                     raise ConnectionError(f"WebSocket recv failed: {e}") from e
 
-                if opcode == WS_BINARY or opcode == WS_TEXT:
+                if opcode in (WS_BINARY, WS_TEXT, WS_CONTINUATION):
+                    # Pure byte-stream tunnel: message boundaries are
+                    # irrelevant (JMP framing carries its own lengths), so
+                    # fragmented messages reassemble naturally by appending
+                    # every data-bearing frame, including continuations.
                     self._recv_buf.extend(payload)
                 elif opcode == WS_PING:
                     # Reply with pong (auto-handle)

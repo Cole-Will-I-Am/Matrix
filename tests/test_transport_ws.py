@@ -11,7 +11,8 @@ from matrix.transport_ws import (
     _ws_read_frame, _ws_write_frame, _ws_recv_exact,
     _ws_client_handshake, _ws_server_handshake,
     WebSocketBackend, WebSocketListener,
-    WS_BINARY, WS_TEXT, WS_CLOSE, WS_PING, WS_PONG,
+    WS_BINARY, WS_TEXT, WS_CONTINUATION, WS_CLOSE, WS_PING, WS_PONG,
+    MAX_WS_FRAME,
 )
 
 
@@ -124,6 +125,19 @@ class TestWsFraming(unittest.TestCase):
         self.assertEqual(len(data), 200)
         self.assertEqual(data, payload)
 
+    def test_read_frame_rejects_oversized_length(self):
+        """A hostile 64-bit length is rejected before the payload is read."""
+        header = bytearray()
+        header.append(0x80 | WS_BINARY)
+        header.append(127)                       # 8-byte extended length follows
+        header.extend(struct.pack("!Q", 1 << 40))  # 1 TiB declared payload
+        sock = MagicMock()
+        with self.assertRaises(ConnectionError) as ctx:
+            _ws_read_frame(sock, bytearray(header))
+        self.assertIn("too large", str(ctx.exception))
+        # Crucially, no attempt was made to read the bogus payload.
+        sock.recv.assert_not_called()
+
     def test_write_medium_payload(self):
         sock = MagicMock()
         payload = b"y" * 200
@@ -140,6 +154,33 @@ class TestWebSocketBackend(unittest.TestCase):
         sock = MagicMock(spec=socket.socket)
         sock.getpeername.return_value = ("127.0.0.1", 8080)
         return WebSocketBackend(sock, is_client=is_client)
+
+    @staticmethod
+    def _frame(opcode, payload):
+        """Build a small (<126 byte) unmasked WebSocket frame."""
+        return bytes(bytearray([0x80 | opcode, len(payload)]) + payload)
+
+    def test_initial_buf_only_feeds_decoder_not_recv_stream(self):
+        """Post-handshake excess is raw frame data, decoded once — not leaked raw."""
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("127.0.0.1", 8080)
+        sock.recv.return_value = b""  # nothing more on the wire
+        frame = self._frame(WS_BINARY, b"hello")
+        backend = WebSocketBackend(sock, is_client=False,
+                                   initial_buf=bytearray(frame))
+        # Must decode the frame to "hello", not return raw header bytes.
+        self.assertEqual(backend.recv_bytes(5), b"hello")
+
+    def test_recv_bytes_reassembles_continuation_frames(self):
+        """Fragmented messages (binary + continuation) reassemble as a stream."""
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("127.0.0.1", 8080)
+        sock.recv.return_value = b""
+        raw = (self._frame(WS_BINARY, b"abc")
+               + self._frame(WS_CONTINUATION, b"def"))
+        backend = WebSocketBackend(sock, is_client=False,
+                                   initial_buf=bytearray(raw))
+        self.assertEqual(backend.recv_bytes(6), b"abcdef")
 
     def test_properties(self):
         backend = self._make_backend()
