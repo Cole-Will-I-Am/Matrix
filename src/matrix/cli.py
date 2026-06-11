@@ -514,6 +514,7 @@ def _director_start(args):
     from matrix.mirror_blend import MirrorRegistry, Blender
     from matrix.autonomous import AutonomousLoop, system_metrics
     from matrix.director import TriStateDirector, ContainmentPolicy
+    from matrix.node_manager import NodeManager
 
     registry = MirrorRegistry()
     blender = Blender(registry)
@@ -521,10 +522,15 @@ def _director_start(args):
     loop.add_metrics_collector(system_metrics)
     loop.start()
 
+    # NodeManager closes the loop: health ticks, auto-heal tasks, and the
+    # director's submit_task / force_session_jump tools all run through it.
+    node_mgr = NodeManager(autonomous=loop)
+    node_mgr.start()
+
     policy = ContainmentPolicy.from_name(
         getattr(args, "containment", None) or _config.director_containment
     )
-    _director_instance = TriStateDirector(loop, policy=policy)
+    _director_instance = TriStateDirector(loop, node_mgr=node_mgr, policy=policy)
     _director_instance.start()
 
     logger.info("Director started.  State: %s  Containment: %s",
@@ -535,6 +541,7 @@ def _director_start(args):
             time.sleep(1)
     except KeyboardInterrupt:
         _director_instance.stop()
+        node_mgr.stop()
         loop.stop()
         logger.info("Director stopped.")
 

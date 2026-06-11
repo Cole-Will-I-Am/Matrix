@@ -129,6 +129,7 @@ class Task:
     retries: int = 0
     max_retries: int = 0
     priority: int = 5                     # lower = higher priority
+    campaign_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +142,7 @@ class Task:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "retries": self.retries,
+            "campaign_id": self.campaign_id,
         }
 
     def __lt__(self, other: Task) -> bool:
@@ -177,7 +179,9 @@ class NodeManager:
     """Central management interface for nodes, tasks, and campaigns.
 
     Thread-safe.  Optionally integrates with RBACManager for permission
-    checks and AutonomousLoop for periodic health polling.
+    checks and AutonomousLoop for periodic health polling, closed-loop
+    healing (degraded nodes get auto-queued discovery tasks whose results
+    refresh the registry), and hot code upgrades via the loop's HotUpgrader.
     """
 
     def __init__(
@@ -185,6 +189,11 @@ class NodeManager:
         local_node=None,               # JumpNode
         rbac=None,                      # Optional[RBACManager]
         autonomous=None,                # Optional[AutonomousLoop]
+        *,
+        auto_heal: bool = True,
+        stale_threshold: float = 30.0,
+        offline_threshold: float = 120.0,
+        heal_cooldown: float = 30.0,
     ) -> None:
         self._local_node = local_node
         self._rbac = rbac
@@ -194,6 +203,18 @@ class NodeManager:
         self._nodes: Dict[str, ManagedNode] = {}
         self._tasks: Dict[str, Task] = {}
         self._campaigns: Dict[str, Campaign] = {}
+
+        # Closed-loop healing (driven by _health_tick)
+        self._auto_heal = auto_heal
+        self._stale_threshold = stale_threshold
+        self._offline_threshold = offline_threshold
+        self._heal_cooldown = heal_cooldown
+        self._heal_campaign_id: Optional[str] = None
+        self._heal_tasks: Dict[str, str] = {}      # node_id → last heal task_id
+        self._heal_last: Dict[str, float] = {}     # node_id → last heal attempt ts
+
+        # Tasks parked because their campaign is paused (campaign_id → tasks)
+        self._deferred: Dict[str, List[Task]] = {}
 
         # Task execution
         self._task_queue: queue.PriorityQueue = queue.PriorityQueue()
@@ -245,6 +266,18 @@ class NodeManager:
             self._execute_task(task)
 
     def _execute_task(self, task: Task) -> None:
+        # Tasks cancelled while still queued must not run.
+        if task.status is TaskStatus.CANCELLED:
+            return
+
+        # Tasks in a paused campaign are parked until resume_campaign().
+        if task.campaign_id is not None:
+            with self._lock:
+                campaign = self._campaigns.get(task.campaign_id)
+                if campaign is not None and campaign.status is CampaignStatus.PAUSED:
+                    self._deferred.setdefault(task.campaign_id, []).append(task)
+                    return
+
         handler = self._handlers.get(task.task_type)
         if handler is None:
             task.status = TaskStatus.FAILED
@@ -306,17 +339,87 @@ class NodeManager:
         if self._local_node is None:
             raise ManagerError("no local node configured")
         devices = self._local_node.discover_targets()
+
+        # Feed results back into the registry: a discovered device that matches
+        # a registered node counts as a heartbeat. This is what closes the
+        # auto-heal loop — a degraded node that answers discovery goes back
+        # online.
+        refreshed = []
+        now = time.time()
+        with self._lock:
+            by_addr = {(n.address, n.port): n for n in self._nodes.values()}
+            for d in devices:
+                node = (self._nodes.get(getattr(d, "device_id", None))
+                        or by_addr.get((d.address, d.port)))
+                if node is not None:
+                    node.status = "online"
+                    node.last_heartbeat = now
+                    refreshed.append(node.node_id)
+
         return {
             "devices": [
                 {"name": d.name, "address": d.address, "port": d.port}
                 for d in devices
             ],
             "count": len(devices),
+            "refreshed_nodes": refreshed,
         }
 
     def _execute_upgrade(self, task: Task) -> dict:
-        # Placeholder: upgrade execution depends on AutonomousLoop
-        return {"status": "upgrade_requested"}
+        """Apply a hot code upgrade through the AutonomousLoop's HotUpgrader.
+
+        Task params:
+            code:          Python source as a string, or
+            code_b64:      base64-encoded Python source, or
+            code_path:     path to a .py file
+            target_module: dotted module name (defaults to the loop's
+                           ``target_module``)
+            tag:           human-readable upgrade label
+
+        The upgrader AST-validates the code (blocked imports/calls) before
+        executing it; a validation failure fails the task.
+        """
+        upgrader = getattr(self._autonomous, "upgrader", None)
+        if upgrader is None:
+            raise ManagerError(
+                "no upgrader available: NodeManager needs an AutonomousLoop"
+            )
+
+        params = task.params
+        if "code" in params:
+            source: Any = params["code"].encode("utf-8")
+        elif "code_b64" in params:
+            import base64
+            source = base64.b64decode(params["code_b64"])
+        elif "code_path" in params:
+            source = params["code_path"]
+        else:
+            raise ManagerError(
+                "upgrade task requires a 'code', 'code_b64', or 'code_path' param"
+            )
+
+        mod_name = params.get("target_module")
+        if mod_name:
+            import sys
+            target_mod = sys.modules.get(mod_name)
+            if target_mod is None:
+                raise ManagerError(f"target module not loaded: {mod_name}")
+        else:
+            target_mod = getattr(self._autonomous, "target_module", None)
+            if target_mod is None:
+                raise ManagerError(
+                    "no target module: pass params['target_module'] or set "
+                    "AutonomousLoop.target_module"
+                )
+
+        tag = params.get("tag", f"task:{task.task_id[:8]}")
+        version = upgrader.apply_upgrade(source, target_mod, tag=tag)
+        return {
+            "status": "upgraded",
+            "version": version,
+            "tag": tag,
+            "module": target_mod.__name__,
+        }
 
     def _resolve_target(self, node_id: str) -> Optional[ManagedNode]:
         with self._lock:
@@ -403,14 +506,63 @@ class NodeManager:
             }
 
     def _health_tick(self, loop) -> None:
-        """Called by AutonomousLoop on each tick to check node health."""
-        stale_threshold = 30.0
+        """Called by AutonomousLoop on each tick: age node health and queue
+        auto-heal tasks for degraded nodes (closed-loop healing)."""
         now = time.time()
+        to_heal: List[str] = []
         with self._lock:
             for node in self._nodes.values():
-                if node.status == "online" and now - node.last_heartbeat > stale_threshold:
+                age = now - node.last_heartbeat
+                if node.status == "online" and age > self._stale_threshold:
                     node.status = "degraded"
                     logger.warning("node %s degraded (no heartbeat)", node.node_id)
+                elif node.status == "degraded" and age > self._offline_threshold:
+                    node.status = "offline"
+                    logger.warning("node %s offline (no heartbeat for %.0fs)",
+                                   node.node_id, age)
+                if node.status == "degraded" and self._auto_heal:
+                    to_heal.append(node.node_id)
+        for node_id in to_heal:
+            self._maybe_submit_heal(node_id)
+
+    def _maybe_submit_heal(self, node_id: str) -> None:
+        """Queue a high-priority discovery task for a degraded node, at most
+        once per heal_cooldown and never while a previous heal is in flight.
+
+        Heal tasks are system-originated and bypass RBAC (there is no
+        external principal); they live in a shared "auto-heal" campaign so
+        they can be paused or stopped like any other work.
+        """
+        now = time.time()
+        with self._lock:
+            if now - self._heal_last.get(node_id, 0.0) < self._heal_cooldown:
+                return
+            prev = self._tasks.get(self._heal_tasks.get(node_id, ""))
+            if prev is not None and prev.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+                return
+            self._heal_last[node_id] = now
+
+            campaign = self._campaigns.get(self._heal_campaign_id or "")
+            if campaign is None:
+                campaign = self.create_campaign("auto-heal", metadata={"system": True})
+                self._heal_campaign_id = campaign.campaign_id
+
+            task = Task(
+                task_id=str(uuid.uuid4()),
+                task_type=TaskType.DISCOVER,
+                target_node_id=node_id,
+                params={"heal": True},
+                priority=1,
+                created_at=now,
+                campaign_id=campaign.campaign_id,
+            )
+            self._tasks[task.task_id] = task
+            campaign.task_ids.append(task.task_id)
+            if node_id not in campaign.node_ids:
+                campaign.node_ids.append(node_id)
+            self._heal_tasks[node_id] = task.task_id
+        self._task_queue.put(task)
+        logger.info("auto-heal: queued discovery for degraded node %s", node_id)
 
     # -- Task Queue ------------------------------------------------------------
 
@@ -422,8 +574,13 @@ class NodeManager:
         max_retries: int = 0,
         priority: int = 5,
         auth_token: Optional[str] = None,
+        campaign_id: Optional[str] = None,
     ) -> Task:
-        """Submit a task to the execution queue."""
+        """Submit a task to the execution queue.
+
+        If `campaign_id` is given, the task joins that campaign and honours
+        its pause/stop state.
+        """
         # RBAC check — mandatory when RBAC is configured
         if self._rbac is not None:
             if auth_token is None:
@@ -452,8 +609,14 @@ class NodeManager:
             max_retries=max_retries,
             priority=priority,
             created_at=time.time(),
+            campaign_id=campaign_id,
         )
         with self._lock:
+            if campaign_id is not None:
+                campaign = self._campaigns.get(campaign_id)
+                if campaign is None:
+                    raise ManagerError(f"unknown campaign: {campaign_id}")
+                campaign.task_ids.append(task.task_id)
             self._tasks[task.task_id] = task
         self._task_queue.put(task)
         logger.info("queued task %s (%s → %s)",
@@ -515,8 +678,13 @@ class NodeManager:
             if campaign is None:
                 raise ManagerError(f"unknown campaign: {campaign_id}")
             campaign.task_ids.append(task_id)
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task.campaign_id = campaign_id
 
     def pause_campaign(self, campaign_id: str) -> None:
+        """Pause a campaign: its queued tasks are parked by the worker and
+        held until resume_campaign()."""
         with self._lock:
             campaign = self._campaigns.get(campaign_id)
             if campaign is None:
@@ -524,20 +692,25 @@ class NodeManager:
             campaign.status = CampaignStatus.PAUSED
 
     def resume_campaign(self, campaign_id: str) -> None:
+        """Resume a paused campaign, re-enqueueing any parked tasks."""
         with self._lock:
             campaign = self._campaigns.get(campaign_id)
             if campaign is None:
                 raise ManagerError(f"unknown campaign: {campaign_id}")
             campaign.status = CampaignStatus.ACTIVE
+            parked = self._deferred.pop(campaign_id, [])
+        for task in parked:
+            self._task_queue.put(task)
 
     def stop_campaign(self, campaign_id: str) -> None:
-        """Cancel all queued tasks and mark campaign completed."""
+        """Cancel all queued/parked tasks and mark campaign completed."""
         with self._lock:
             campaign = self._campaigns.get(campaign_id)
             if campaign is None:
                 raise ManagerError(f"unknown campaign: {campaign_id}")
             for tid in campaign.task_ids:
                 self.cancel_task(tid)
+            self._deferred.pop(campaign_id, None)
             campaign.status = CampaignStatus.COMPLETED
 
     def campaign_status(self, campaign_id: str) -> dict:

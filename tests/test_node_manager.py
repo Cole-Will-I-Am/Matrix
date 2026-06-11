@@ -529,5 +529,240 @@ class TestNodeManagerCustomHandler(unittest.TestCase):
         self.assertEqual(task.result, {"custom": True})
 
 
+# ── Closed-loop orchestration (upgrade wiring, campaign enforcement, healing) ─
+
+def _wait_task(task, timeout=5.0):
+    deadline = time.time() + timeout
+    while task.status in (TaskStatus.QUEUED, TaskStatus.RUNNING) and time.time() < deadline:
+        time.sleep(0.02)
+
+
+class _FakeDevice:
+    def __init__(self, device_id, name, address, port):
+        self.device_id = device_id
+        self.name = name
+        self.address = address
+        self.port = port
+
+
+class _FakeLocalNode:
+    """Stand-in JumpNode whose discovery returns a fixed device list."""
+
+    def __init__(self, devices=()):
+        self.devices = list(devices)
+
+    def discover_targets(self):
+        return list(self.devices)
+
+
+class TestNodeManagerUpgrade(unittest.TestCase):
+    """The UPGRADE handler must drive the AutonomousLoop's HotUpgrader."""
+
+    def setUp(self):
+        import types
+        from matrix.mirror_blend import MirrorRegistry, Blender
+        from matrix.autonomous import AutonomousLoop
+
+        registry = MirrorRegistry()
+        blender = Blender(registry)
+        self.loop = AutonomousLoop(registry, blender)  # not started: no ticking
+        self.target = types.ModuleType("_upgrade_target_test")
+        self.target.greet = lambda: "old"
+        self.loop.target_module = self.target
+        self.mgr = NodeManager(autonomous=self.loop)
+        self.mgr.register_node("n1", "alpha", "10.0.0.1")
+
+    def tearDown(self):
+        _safe_stop(self.mgr)
+        self.loop.upgrader.rollback_all()
+
+    def _run(self, params, **kwargs):
+        task = self.mgr.submit_task(TaskType.UPGRADE, "n1", params=params, **kwargs)
+        self.mgr.start()
+        _wait_task(task)
+        self.mgr.stop()
+        return task
+
+    def test_upgrade_applies_code_to_loop_target_module(self):
+        task = self._run({"code": "def greet():\n    return 'new'\n"})
+        self.assertEqual(task.status, TaskStatus.DONE)
+        self.assertEqual(task.result["status"], "upgraded")
+        self.assertEqual(self.target.greet(), "new")
+        # Rollback restores the original
+        self.assertTrue(self.loop.upgrader.rollback(task.result["version"]))
+        self.assertEqual(self.target.greet(), "old")
+
+    def test_upgrade_explicit_target_module(self):
+        import sys
+        sys.modules["_upgrade_target_test"] = self.target
+        try:
+            task = self._run({
+                "code": "def greet():\n    return 'explicit'\n",
+                "target_module": "_upgrade_target_test",
+            })
+            self.assertEqual(task.status, TaskStatus.DONE)
+            self.assertEqual(self.target.greet(), "explicit")
+        finally:
+            sys.modules.pop("_upgrade_target_test", None)
+
+    def test_upgrade_requires_code_param(self):
+        task = self._run({})
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("code", task.error)
+
+    def test_upgrade_blocked_code_fails_task(self):
+        task = self._run({"code": "import os\ndef greet():\n    return 'evil'\n"})
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("blocked", task.error)
+        self.assertEqual(self.target.greet(), "old")
+
+    def test_upgrade_without_autonomous_fails(self):
+        mgr = NodeManager()
+        mgr.register_node("n1", "alpha", "10.0.0.1")
+        task = mgr.submit_task(TaskType.UPGRADE, "n1", params={"code": "x = 1\n"})
+        mgr.start()
+        _wait_task(task)
+        _safe_stop(mgr)
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("upgrader", task.error)
+
+
+class TestCampaignEnforcement(unittest.TestCase):
+    """Pause/stop must actually gate task execution, not just flip a flag."""
+
+    def setUp(self):
+        self.mgr = NodeManager(auto_heal=False)
+        self.mgr.register_node("n1", "alpha", "10.0.0.1")
+        self.ran = []
+        self.mgr.register_handler(
+            TaskType.CUSTOM,
+            lambda t: (self.ran.append(t.task_id), {"ok": True})[1],
+        )
+
+    def tearDown(self):
+        _safe_stop(self.mgr)
+
+    def test_paused_campaign_parks_tasks_until_resume(self):
+        c = self.mgr.create_campaign("c1")
+        self.mgr.pause_campaign(c.campaign_id)
+        task = self.mgr.submit_task(TaskType.CUSTOM, "n1", campaign_id=c.campaign_id)
+        self.mgr.start()
+        time.sleep(0.3)
+        self.assertEqual(self.ran, [])                      # parked, not run
+        self.assertEqual(task.status, TaskStatus.QUEUED)
+
+        self.mgr.resume_campaign(c.campaign_id)
+        _wait_task(task)
+        self.assertEqual(task.status, TaskStatus.DONE)
+        self.assertEqual(self.ran, [task.task_id])
+
+    def test_stopped_campaign_cancels_parked_tasks(self):
+        c = self.mgr.create_campaign("c1")
+        self.mgr.pause_campaign(c.campaign_id)
+        task = self.mgr.submit_task(TaskType.CUSTOM, "n1", campaign_id=c.campaign_id)
+        self.mgr.start()
+        time.sleep(0.3)
+        self.mgr.stop_campaign(c.campaign_id)
+        self.assertEqual(task.status, TaskStatus.CANCELLED)
+        # Resuming a completed campaign must not resurrect cancelled tasks
+        self.mgr.resume_campaign(c.campaign_id)
+        time.sleep(0.2)
+        self.assertEqual(self.ran, [])
+
+    def test_cancelled_queued_task_is_not_executed(self):
+        task = self.mgr.submit_task(TaskType.CUSTOM, "n1")
+        self.mgr.cancel_task(task.task_id)
+        self.mgr.start()
+        time.sleep(0.3)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(task.status, TaskStatus.CANCELLED)
+
+    def test_submit_task_unknown_campaign_raises(self):
+        with self.assertRaises(ManagerError):
+            self.mgr.submit_task(TaskType.CUSTOM, "n1", campaign_id="nope")
+
+
+class TestAutoHeal(unittest.TestCase):
+    """_health_tick must close the loop: degrade → heal task → discovery
+    result refreshes the registry."""
+
+    def test_health_tick_queues_heal_task_once(self):
+        mgr = NodeManager()
+        node = mgr.register_node("n1", "alpha", "10.0.0.1")
+        node.last_heartbeat = time.time() - 60
+        mgr._health_tick(None)
+        self.assertEqual(node.status, "degraded")
+        heals = [t for t in mgr.list_tasks() if t.params.get("heal")]
+        self.assertEqual(len(heals), 1)
+        self.assertEqual(heals[0].task_type, TaskType.DISCOVER)
+        self.assertEqual(heals[0].target_node_id, "n1")
+        # Within the cooldown and with the heal still queued: no duplicate
+        mgr._health_tick(None)
+        heals = [t for t in mgr.list_tasks() if t.params.get("heal")]
+        self.assertEqual(len(heals), 1)
+        _safe_stop(mgr)
+
+    def test_heal_tasks_live_in_auto_heal_campaign(self):
+        mgr = NodeManager()
+        node = mgr.register_node("n1", "alpha", "10.0.0.1")
+        node.last_heartbeat = time.time() - 60
+        mgr._health_tick(None)
+        campaigns = [c for c in mgr.list_campaigns() if c.name == "auto-heal"]
+        self.assertEqual(len(campaigns), 1)
+        self.assertEqual(len(campaigns[0].task_ids), 1)
+        self.assertIn("n1", campaigns[0].node_ids)
+        _safe_stop(mgr)
+
+    def test_auto_heal_disabled(self):
+        mgr = NodeManager(auto_heal=False)
+        node = mgr.register_node("n1", "alpha", "10.0.0.1")
+        node.last_heartbeat = time.time() - 60
+        mgr._health_tick(None)
+        self.assertEqual(node.status, "degraded")
+        self.assertEqual(mgr.list_tasks(), [])
+        _safe_stop(mgr)
+
+    def test_degraded_node_goes_offline(self):
+        mgr = NodeManager(auto_heal=False)
+        node = mgr.register_node("n1", "alpha", "10.0.0.1")
+        node.last_heartbeat = time.time() - 60
+        mgr._health_tick(None)
+        self.assertEqual(node.status, "degraded")
+        node.last_heartbeat = time.time() - 200       # past offline_threshold
+        mgr._health_tick(None)
+        self.assertEqual(node.status, "offline")
+        _safe_stop(mgr)
+
+    def test_discovery_refreshes_known_node(self):
+        """End-to-end heal: degraded node found by discovery goes back online."""
+        local = _FakeLocalNode([_FakeDevice("n1", "alpha", "10.0.0.1", 47701)])
+        mgr = NodeManager(local_node=local, heal_cooldown=0.0)
+        node = mgr.register_node("n1", "alpha", "10.0.0.1", 47701)
+        node.last_heartbeat = time.time() - 60
+        mgr._health_tick(None)                         # degrade + queue heal
+        self.assertEqual(node.status, "degraded")
+        heal = [t for t in mgr.list_tasks() if t.params.get("heal")][0]
+        mgr.start()
+        _wait_task(heal)
+        _safe_stop(mgr)
+        self.assertEqual(heal.status, TaskStatus.DONE)
+        self.assertIn("n1", heal.result["refreshed_nodes"])
+        self.assertEqual(node.status, "online")
+        self.assertLess(time.time() - node.last_heartbeat, 5.0)
+
+    def test_discovery_matches_by_address_when_id_differs(self):
+        local = _FakeLocalNode([_FakeDevice("ephemeral-x25519", "alpha", "10.0.0.1", 47701)])
+        mgr = NodeManager(local_node=local)
+        node = mgr.register_node("n1", "alpha", "10.0.0.1", 47701)
+        node.status = "degraded"
+        task = mgr.submit_task(TaskType.DISCOVER, "n1")
+        mgr.start()
+        _wait_task(task)
+        _safe_stop(mgr)
+        self.assertEqual(task.status, TaskStatus.DONE)
+        self.assertIn("n1", task.result["refreshed_nodes"])
+        self.assertEqual(node.status, "online")
+
+
 if __name__ == "__main__":
     unittest.main()
